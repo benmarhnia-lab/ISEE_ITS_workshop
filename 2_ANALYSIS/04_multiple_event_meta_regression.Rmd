@@ -1,0 +1,285 @@
+---
+title: "Extension to Multiple Events"
+subtitle: "Part 4 of ISEE pre-conference workshop Interrupted Time Series Analysis in Environmental Epidemiology: An Overview of Traditional and Novel Modeling Approaches"
+date: "2026-08-30"
+author: "Tarik Benmarhnia, Yiqun Ma"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+params:
+  data_path: "../../1_DATA/multiple_event_data.RDS"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.align = "center",
+  out.width = "100%"
+)
+```
+
+# Learning objectives
+
+By the end of this section, you should be able to:
+
+1. Explain how the ITS framework can be extended to a sequence of multiple events.
+2. Describe the key assumptions of the multiple-event ITS design.
+3. Use a univariate random-effects meta-regression to explore potential effect modification by event-level characteristics.
+4. Interpret the coefficients from the meta-regression.
+
+
+# From one event to multiple events
+
+In the previous examples, we used interrupted time series analysis to estimate the effect of **one wildfire smoke event**. The same framework can be extended to multiple events:
+
+1. For each event, use an appropriate pre-event period to train and evaluate a counterfactual model.
+2. Use each event-specific model to estimate the excess hospitalizations and associated uncertainty for that event.
+
+This design requires sufficient unaffected pre-event data for each event. Events must also be adequately separated so that the pre-event period for one event is not affected by an earlier event. Here, we assume that the effect diminishes shortly after each smoke episode. Therefore, after an appropriate post-event washout period, observations following event \(n\) may be used as pre-event data to build the counterfactual model for event \(n+1\).
+
+A major advantage of the multiple-event framework is that it allows us to examine **why event effects differ**. Event-level characteristics can be included as potential effect modifiers in a meta-regression.
+
+In this workshop example, we begin with a simulated dataset containing 60 wildfire smoke events from a single county. For each event, the dataset includes the estimated excess hospitalizations, associated uncertainty, and several event-level characteristics (duration, smoke intensity, and season).
+
+
+# Load required packages
+
+```{r load-packages}
+library(dplyr)
+library(tibble)
+library(tidyr)
+library(ggplot2)
+library(patchwork)
+library(mvmeta)
+```
+
+```{r analysis-options}
+theme_set(
+  theme_minimal(base_size = 12) +
+    theme(
+      panel.grid.minor = element_blank(),
+      plot.title.position = "plot",
+      plot.caption.position = "plot"
+    )
+)
+```
+
+The `mvmeta` package can fit both univariate and multivariate meta-analysis and meta-regression models. We use a **univariate random-effects meta-regression** because each event contributes one outcome estimate: cumulative excess hospitalizations. See the [`mvmeta` package manual](https://cran.r-project.org/web/packages/mvmeta/mvmeta.pdf) for additional details.
+
+# Step 1: Load the fake multiple-event dataset
+
+Load the "multiple_event_data.RDS" using its file path in your device. This dataset is entirely simulated for teaching. 
+
+```{r read-multiple-event-data}
+multiple_event_data <- readRDS(
+  params$data_path
+) %>%
+  as_tibble() %>%
+  mutate(
+    event_id = as.integer(event_id),
+    season = factor(
+      as.character(season),
+      levels = c(
+        "Spring",
+        "Summer",
+        "Fall",
+        "Winter"
+      )
+    )
+  ) %>%
+  arrange(event_id)
+
+```
+
+## Inspect the data
+
+```{r inspect-data-structure}
+glimpse(multiple_event_data)
+```
+
+```{r variable-dictionary}
+variable_dictionary <- tribble(
+  ~variable, ~meaning,
+  "event_id", "Unique smoke-event identifier",
+  "excess_hospitalizations", "Estimated cumulative excess hospitalizations for the event",
+  "excess_lower", "Lower limit of the excess hospitalization 95% CI",
+  "excess_upper", "Upper limit of the excess hospitalization 95% CI",
+  "excess_se", "Standard error of the event-specific excess estimate",
+  "excess_variance", "Variance of the event-specific excess estimate",
+  "event_duration", "Duration of the smoke event in days",
+  "event_intensity", "Mean smoke PM2.5 during the event in µg/m³",
+  "season", "Season in which the event occurred"
+)
+
+variable_dictionary %>%
+  knitr::kable(
+    col.names = c("Variable", "Meaning")
+  )
+```
+
+View the first 10 events as examples
+```{r display-first-ten-events}
+multiple_event_data %>%
+  slice_head(n = 10) %>%
+  knitr::kable(digits = 2)
+```
+
+Each row represents one smoke event. The ITS analysis produced two essential quantities:
+
+- `excess_hospitalizations`, the event-specific effect estimate; and
+- `excess_se`, its standard error.
+
+The meta-regression in `mvmeta` package uses the effect estimate and its sampling variance, calculated as the squared standard error.
+
+```{r summarize-multiple-event-data}
+multiple_event_data %>%
+  summarise(
+    number_of_events = n(),
+    mean_excess = mean(excess_hospitalizations),
+    minimum_excess = min(excess_hospitalizations),
+    maximum_excess = max(excess_hospitalizations),
+    mean_duration_days = mean(event_duration),
+    mean_intensity = mean(event_intensity)
+  ) %>%
+  knitr::kable(digits = 2)
+```
+
+```{r summarize-events-by-season}
+multiple_event_data %>%
+  group_by(season) %>%
+  summarise(
+    number_of_events = n(),
+    mean_duration = mean(event_duration),
+    mean_intensity = mean(event_intensity),
+    mean_excess = mean(excess_hospitalizations),
+    .groups = "drop"
+  ) %>%
+  knitr::kable(digits = 2)
+```
+
+
+# Step 2: Specify the random-effects meta-regression
+
+We divide intensity by 10 so that its coefficient represents a 10-µg/m³ difference rather than a 1-µg/m³ difference.
+
+```{r prepare-meta-regression-data}
+meta_regression_data <- multiple_event_data %>%
+  mutate(
+    event_intensity_10 =
+      event_intensity / 10
+  )
+```
+
+
+```{r fit-meta-regression}
+model_meta_regression <- mvmeta(
+  excess_hospitalizations ~
+    event_duration +
+    event_intensity_10 +
+    season,
+  S = meta_regression_data$excess_variance,
+  data = meta_regression_data,
+  method = "reml"
+)
+
+summary(model_meta_regression)
+```
+
+The meta-regression indicates that event duration, smoke intensity, and season are associated with event-specific excess hospitalizations.
+
+After adjusting for the other event characteristics, each additional event day is associated with 1.88 more excess hospitalizations (95% CI: 1.47, 2.30), while each 10-µg/m³ increase in event intensity is associated with 6.75 more excess hospitalizations (95% CI: 5.61, 7.89).
+
+Compared with spring events of the same duration and intensity, the estimated excess is higher by 6.42 hospitalizations for summer events (95% CI: 1.32, 11.52), 10.92 for fall events (95% CI: 5.90, 15.94), and 5.58 for winter events (95% CI: 0.58, 10.58).
+
+The Cochran Q test indicates that significant heterogeneity remains after accounting for the included characteristics. This indicates that duration, intensity, and season explain some differences among events, but other unmeasured event characteristics may also contribute to variation in their effects.
+
+# Step 3: Coefficient plot
+
+```{r extract-meta-regression-coefficients}
+coefficient_results <- summary(
+  model_meta_regression,
+  ci.level = 0.95
+)$coefficients %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column(
+    var = "term"
+  )
+
+```
+
+
+```{r meta-regression-coefficient-plot, fig.width=8.5, fig.height=4.8}
+coefficient_plot_data <- coefficient_results %>%
+  filter(term != "(Intercept)") %>%
+  mutate(
+    characteristic = recode(
+      term,
+      "event_duration" =
+        "Duration: per additional day",
+      "event_intensity_10" =
+        "Intensity: per 10 µg/m³",
+      "seasonSummer" =
+        "Summer vs. spring",
+      "seasonFall" =
+        "Fall vs. spring",
+      "seasonWinter" =
+        "Winter vs. spring"
+    ),
+    characteristic = factor(
+      characteristic,
+      levels = rev(
+        c(
+          "Duration: per additional day",
+          "Intensity: per 10 µg/m³",
+          "Summer vs. spring",
+          "Fall vs. spring",
+          "Winter vs. spring"
+        )
+      )
+    )
+  )
+
+coefficient_plot_data %>%
+  ggplot(
+    aes(
+      x = Estimate,
+      y = characteristic
+    )
+  ) +
+  geom_vline(
+    xintercept = 0,
+    linetype = "dashed",
+    color = "grey50"
+  ) +
+  geom_errorbarh(
+    aes(
+      xmin = `95%ci.lb`,
+      xmax = `95%ci.ub`
+    ),
+    height = 0.15,
+    color = "#0072B2"
+  ) +
+  geom_point(
+    size = 3,
+    color = "#0072B2"
+  ) +
+  labs(
+    title = "Meta-regression of smoke-event characteristics",
+    x = "Difference in excess hospitalizations",
+    y = NULL
+  )
+```
+
+
+
+# Important interpretation and design considerations
+
+1. The validity of this meta-regression depends on credible event-specific ITS estimates as input.
+2. Interpret effect modification cautiously: Associations with event characteristics can be confounded by unmeasured event- or population-level factors.
+3. Account for clustering when needed: The present fake example assumes one county. Multiple counties require additional structure to account for repeated events within counties.
+4. Absolute excess hospitalizations are comparable here because the events are assumed to occur in the same county. Across locations with different population sizes or baseline hospitalization volumes, a standardized effect measure may be preferable.
+

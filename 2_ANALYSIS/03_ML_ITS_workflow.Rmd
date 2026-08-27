@@ -1,0 +1,979 @@
+---
+title: "Two-Stage Machine Learning-Integrated Interrupted Time Series Analysis"
+subtitle: "Part 3 of ISEE pre-conference workshop Interrupted Time Series Analysis in Environmental Epidemiology: An Overview of Traditional and Novel Modeling Approaches"
+date: "2026-08-30"
+author: "Tarik Benmarhnia, Yiqun Ma"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+params:
+  data_path: "../../1_DATA/data_case_study_11to18.RDS"
+  bootstrap_reps: 1000
+  block_length: 14
+  seed: 2025
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.align = "center",
+  out.width = "100%",
+  cache.lazy = FALSE
+)
+```
+
+# Learning objectives
+
+By the end of this section, you should be able to:
+
+1. Explain the two stages of a machine learning-integrated interrupted time series (ML-ITS) design.
+2. Distinguish training, pre-event testing, and event-effect estimation periods.
+3. Fit and evaluate a Prophet-XGBoost prediction model.
+4. Estimate daily and cumulative excess hospitalizations during the smoke event.
+
+This section is designed mainly as a **pre-rendered R Markdown walkthrough** because tuning candidate parameter combinations and running 1,000 bootstrap replicates can take substantial time.
+
+# Load required packages
+
+```{r load-packages}
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(ggplot2)
+library(timetk)
+library(lubridate)
+library(tidymodels)
+library(modeltime)
+library(scales)
+```
+
+`tidymodels` provides a consistent grammar for preprocessing, model specification, resampling, tuning, fitting, and evaluation. `modeltime` adds time-series forecasting models, including Prophet-XGBoost, to that grammar. `timetk` supplies time-series data manipulation and resampling tools. The other packages support data manipulation, plotting, timing, and parameter transformations.
+
+```{r analysis-options}
+theme_set(
+  theme_minimal(base_size = 12) +
+    theme(
+      panel.grid.minor = element_blank(),
+      plot.title.position = "plot",
+      plot.caption.position = "plot"
+    )
+)
+
+set.seed(params$seed)
+```
+
+
+# The two-stage ML-ITS idea
+
+**Stage 1: Construct and evaluate the counterfactual model.** We use only observations from before the wildfire smoke event. The model learns how respiratory hospitalizations normally vary with time, season, recent environmental conditions, and other calendar features. A later pre-event period is held out to evaluate how accurately the model predicts genuinely unseen days.
+
+**Stage 2: Estimate the event effect.** We apply the fitted pre-event model to dates during or after the event to predict the hospitalizations that would have been expected if the smoke event had not occurred. Excess hospitalizations are the observed counts minus these counterfactual predictions.
+
+# Step 1: Read and prepare the data
+
+```{r read-and-prepare-data}
+## load the case study dataset "data_case_study_11to18.RDS" using its file path in your device
+data <- readRDS(params$data_path) %>%
+  as_tibble() %>%
+  arrange(date)%>%
+  select(
+    date,
+    respiratory,
+    PM25_nonsmk,
+    Tmean,
+    RH,
+    Prcp
+  )
+```
+
+We include non-smoke PM2.5 as a predictor of the outcome's usual variation. We do **not** include smoke PM2.5 because it defines the event of interest. Conditioning the counterfactual model on the smoke component would allow information about the intervention to enter the no-smoke prediction.
+
+```{r modeling-data-summary}
+data %>%
+  summarise(
+    start_date = min(date),
+    end_date = max(date),
+    number_of_days = n(),
+    mean_daily_hospitalizations = mean(respiratory),
+    missing_values = sum(is.na(across(everything())))
+  ) %>%
+  knitr::kable(digits = 1)
+```
+
+# Step 2: Create the training and testing split
+
+```{r published-data-split}
+data.train <- data %>%
+  filter(
+    date >= as.Date("2011-01-01") &
+      date <= as.Date("2018-06-30")
+  )
+
+data.test <- data %>%
+  filter(
+    date >= as.Date("2018-07-01") &
+      date <= as.Date("2018-11-08")
+  )
+
+data.event <- data %>%
+  filter(
+    date >= as.Date("2018-11-09") &
+      date <= as.Date("2018-11-20")
+  )
+
+data.postevent <- data %>%
+  filter(
+    date >= as.Date("2018-11-21")
+  )
+
+split_summary <- tribble(
+  ~period, ~start_date, ~end_date, ~number_of_days,
+  "Training", min(data.train$date), max(data.train$date), nrow(data.train),
+  "Pre-event test", min(data.test$date), max(data.test$date), nrow(data.test),
+  "Smoke event", min(data.event$date), max(data.event$date), nrow(data.event),
+  "Post-event", min(data.postevent$date), max(data.postevent$date), nrow(data.postevent)
+)
+
+knitr::kable(split_summary)
+```
+
+- **Training:** January 1, 2011 through June 30, 2018. These observations are used for cross-validation, tuning, and final model fitting.
+- **Pre-event test:** July 1 through November 8, 2018. These outcomes remain untouched during tuning and provide an honest evaluation immediately before the event.
+- **Smoke event:** November 9 through November 20, 2018. Outcomes in these 12 days are used only after the counterfactual model has been finalized.
+- **Post-event:** November 21 through December 31, 2018. Outcomes in this post-event period are also used only after the counterfactual model has been finalized. This period can be used to examine the lagged effect of the event.
+
+
+```{r data-split-figure, fig.width=10, fig.height=4.8}
+split_plot_data <- bind_rows(
+  data.train %>% mutate(period = "Training"),
+  data.test %>% mutate(period = "Pre-event test"),
+  data.event %>% mutate(period = "Smoke event"),
+  data.postevent %>% mutate(period = "Post-event")
+) %>%
+  mutate(
+    period = factor(
+      period,
+      levels = c(
+        "Training",
+        "Pre-event test",
+        "Smoke event",
+        "Post-event"
+      )
+    )
+  )
+
+ggplot(
+  split_plot_data,
+  aes(
+    x = date,
+    y = respiratory,
+    color = period
+  )
+) +
+  geom_line(linewidth = 0.35, alpha = 0.8) +
+  scale_color_manual(
+    values = c(
+      "Training" = "#0072B2",
+      "Pre-event test" = "#009E73",
+      "Smoke event" = "#D55E00",
+      "Post-event" = "#F59F27"
+    )
+  ) +
+  labs(
+    title = "Data split visualization",
+    x = NULL,
+    y = "Daily respiratory hospitalizations",
+    color = NULL
+  ) +
+  theme(legend.position = "bottom")
+```
+
+# Step 3: Create time-series cross-validation folds
+
+```{r create-cross-validation-folds}
+resamples_kfold_resp <- data.train %>%
+  time_series_cv(
+    date_var = date,
+    assess = "12 months",
+    initial = "2 years",
+    slice_limit = 5,
+    skip = "12 months",
+    cumulative = FALSE
+  )
+```
+
+This is the cross-validation specification:
+
+- `data.train %>%` passes the training data into `time_series_cv()` as its first argument.
+- `date_var = date` identifies the variable that determines temporal order.
+- `assess = "12 months"` makes every validation window one year long.
+- `initial = "2 years"` makes every fold-specific training window two years long.
+- `slice_limit = 5` returns the five most recent eligible folds.
+- `skip = "12 months"` moves successive validation windows approximately one year apart, making them non-overlapping.
+- `cumulative = FALSE` keeps every training window fixed at two years. If this were `TRUE`, the training window would expand and `initial` would not define a fixed two-year window.
+
+The word **assessment** refers to the fold-specific validation data. These should not be confused with the final `data.test` set, which is not part of cross-validation.
+
+```{r summarize-cross-validation-folds}
+cv_summary <- resamples_kfold_resp %>%
+  transmute(
+    fold = id,
+    training_start = map_chr(
+      splits,
+      ~ format(min(analysis(.x)$date))
+    ),
+    training_end = map_chr(
+      splits,
+      ~ format(max(analysis(.x)$date))
+    ),
+    validation_start = map_chr(
+      splits,
+      ~ format(min(assessment(.x)$date))
+    ),
+    validation_end = map_chr(
+      splits,
+      ~ format(max(assessment(.x)$date))
+    ),
+    training_days = map_int(
+      splits,
+      ~ nrow(analysis(.x))
+    ),
+    validation_days = map_int(
+      splits,
+      ~ nrow(assessment(.x))
+    )
+  )
+
+knitr::kable(cv_summary)
+```
+
+`resamples_kfold_resp` is a tibble with one row per fold. Its `splits` column is a list-column: every cell contains the row indices for that fold.
+
+```{r cross-validation-plan, fig.width=10, fig.height=6}
+resamples_kfold_resp %>%
+  tk_time_series_cv_plan() %>%
+  plot_time_series_cv_plan(
+    date,
+    respiratory,
+    .interactive = FALSE
+  ) +
+  labs(
+    title = "Five fixed-window time-series cross-validation folds",
+    x = NULL,
+    y = "Daily respiratory hospitalizations"
+  )
+```
+
+`tk_time_series_cv_plan()` converts the resampling object into a plotting-friendly tibble. `plot_time_series_cv_plan()` then shows the training and validation dates for every fold. Random cross-validation is inappropriate here because it could train a model on future dates and test it on earlier dates.
+
+# Step 4: Define the preprocessing recipe
+
+```{r create-recipe}
+rec_obj_phxgb <- recipe(
+  respiratory ~ .,
+  data = data.train
+) %>%
+  step_timeseries_signature(date) %>%
+  step_lag(
+    PM25_nonsmk,
+    Tmean,
+    RH,
+    Prcp,
+    lag = 1:7
+  ) %>%
+  step_fourier(
+    date,
+    period = 365,
+    K = 2
+  ) %>%
+  step_rm(
+    matches("(.iso$)|(.xts$)|(.lbl$)"),
+    "date_hour",
+    "date_minute",
+    "date_second",
+    "date_hour12",
+    "date_am.pm"
+  ) %>%
+  step_normalize(
+    matches("(index.num$)|(_year$)")
+  )
+```
+
+A `recipe` is a reusable preprocessing blueprint. It records how raw variables should be converted into model-ready predictors and ensures that the same transformations are applied during cross-validation, final fitting, and prediction.
+
+- `recipe(respiratory ~ ., data = data.train)` declares `respiratory` as the outcome. The dot means “use every other retained variable as a predictor.” Supplying `data.train` defines the variables and their types but does not yet fit the final outcome model.
+- `step_timeseries_signature(date)` derives calendar and time-index features from `date`, such as year, quarter, month, week, day of week, day of year, and a numeric time index.
+- `step_lag(..., lag = 1:7)` creates 1-day through 7-day lagged values for non-smoke PM2.5, temperature, relative humidity, and precipitation. For example, lag-1 temperature on November 9 is the temperature observed on November 8. Only past values are used.
+- `step_fourier(date, period = 365, K = 2)` creates two annual sine-cosine pairs. These four variables provide a smooth representation of seasonality while allowing XGBoost to combine them nonlinearly with other predictors.
+- `step_rm()` removes time-signature variables that are redundant, unsupported by the model, or irrelevant for daily data. `matches()` selects column names using a regular expression.
+- `step_normalize()` centers and scales the continuous numeric time index and year variables using means and standard deviations learned from the training data.
+
+```{r inspect-prepared-recipe}
+prepared_recipe <- rec_obj_phxgb %>%
+  prep()
+
+processed_training_data <- prepared_recipe %>% 
+  juice()
+
+recipe_variable_table <- prepared_recipe %>%
+  summary() %>%
+  select(
+    variable,
+    type,
+    role
+  )
+
+recipe_variable_table %>%
+  knitr::kable()
+```
+
+- `prep()` estimates preprocessing quantities using the training data.
+- `juice()` returns the processed training dataset from a prepared recipe.
+
+This inspection is pedagogical. When the recipe is placed in a workflow, `tidymodels` automatically prepares it separately within each cross-validation fold, which helps prevent information from the validation window leaking into fold-specific preprocessing.
+
+# Step 5: Specify the tunable Prophet-XGBoost model
+
+```{r specify-tunable-model}
+model_phxgb_tune <- prophet_boost(
+  mode = "regression",
+  growth = "linear",
+  seasonality_yearly = TRUE,
+  changepoint_range = tune(),
+  prior_scale_changepoints = tune(),
+  prior_scale_seasonality = tune(),
+  mtry = tune(),
+  min_n = tune(),
+  tree_depth = tune(),
+  learn_rate = tune(),
+  loss_reduction = tune(),
+  stop_iter = tune()
+) %>%
+  set_engine("prophet_xgboost")
+```
+
+`prophet_boost()` specifies a hybrid model:
+
+1. Prophet represents broad temporal structure through a trend and seasonal components.
+2. XGBoost then models patterns remaining in the Prophet residuals using an ensemble of regression trees, allowing nonlinear relationships and interactions among the predictors.
+
+`mode = "regression"` indicates that we are predicting a numeric outcome (otherwise "classification" for categorical outcomes). Every `tune()` indicates that the parameter is not fixed in advance. Candidate values are defined later in the tuning grid, and the combination with the lowest average cross-validation RMSE will be selected.
+
+The Prophet parameters control:
+
+- `growth`: the form of the long-term trend (use "linear" when; use "logistic" when the long-term outcome trend is expected to level off at a known or scientifically meaningful limit);
+- `seasonality_yearly`: whether to model a repeating annual seasonal pattern (TRUE or FALSE);
+- `changepoint_range`: the portion of the history in which Prophet may place trend changepoints (a changepoint is a date when the long-term trend is allowed to change direction or speed). For example, 0.8 allows changepoints within the first 80% of the training period and leaves the final 20% for trend projection;
+- `prior_scale_changepoints`: how easily Prophet allows the long-term trend to change (smaller values produce a smoother and more stable trend; larger values allow more frequent or pronounced trend changes); and
+- `prior_scale_seasonality`: how flexible the seasonal component may be (smaller values shrink the seasonal component toward a simpler pattern; larger values allow stronger and more flexible seasonality).
+
+The XGBoost parameters control:
+
+- `mtry`: the number of predictors considered when a tree split is created (smaller values restrict the model and can reduce overfitting, while larger values give the model more opportunities to find a strong split);
+- `min_n`: the minimum number of observations required in a terminal node (smaller values allow permit highly detailed patterns but may increase the risk of overfitting; larger values produce simpler and more stable trees but may miss uncommon genuine patterns);
+- `tree_depth`: the maximum complexity of each tree (shallow trees capture relatively simple relationships; deeper trees can represent more complicated interactions but are more likely to overfit);
+- `learn_rate`: how much each new tree contributes (smaller values make learning slower and more gradual; larger values learn faster but can overfit or produce unstable results);
+- `loss_reduction`: the improvement required to create another split (small values allow more splits; large values require stronger evidence that a split is useful); and
+- `stop_iter`: the early-stopping patience when additional trees stop improving performance (This prevents unnecessary trees from being added after performance stops improving).
+
+`set_engine("prophet_xgboost")` tells R to fit the hybrid Prophet–XGBoost model. 
+
+# Step 6: Generate tuning grid
+
+```{r generate-tuning-grid}
+set.seed(2025)
+
+grid_phxgb_tune <- grid_space_filling(
+  extract_parameter_set_dials(model_phxgb_tune) %>%
+    update(
+      changepoint_range = changepoint_range(
+        range = c(0.4, 0.8), trans = NULL
+      ),
+      prior_scale_changepoints = prior_scale_changepoints(
+        range = c(0.01, 0.5), trans = NULL
+      ),
+      prior_scale_seasonality = prior_scale_seasonality(
+        range = c(0.5, 2.0), trans = NULL
+      ),
+      mtry = mtry(
+        range = c(4, 25), trans = NULL
+      ),
+      min_n = min_n(
+        range = c(1L, 12L), trans = NULL
+      ),
+      tree_depth = tree_depth(
+          range = c(3, 15), trans = NULL
+      ),
+      learn_rate = learn_rate(
+        range = c(0.001, 0.1), trans = NULL
+      ),
+      loss_reduction = loss_reduction(
+        range = c(-12, 2), trans = log10_trans()
+      ),
+      stop_iter = stop_iter(
+        range = c(10L, 30L), trans = NULL
+      )
+    ),
+  size = 100
+)
+```
+
+- `extract_parameter_set_dials()` collects all parameters marked with `tune()`.
+- `update()` replaces their default ranges with the ranges we specified.
+- `range = c(a, b)` gives the lower and upper search limits.
+- The `L` in values such as `1L` stores the value as an integer, as required for counts of observations, levels, or iterations.
+- `log10_trans()` searches `loss_reduction` over orders of magnitude rather than concentrating candidates on a linear scale.
+- `grid_space_filling(..., size = 100)` creates 100 well-spread combinations across the multidimensional parameter space. It is more efficient than evaluating every possible combination in a full Cartesian grid.
+
+These ranges are reproduced from a published example for consistency and should not be treated as universally optimal.
+
+```{r inspect-tuning-grid}
+# display the first 10 parameter combinations from the tuning grid as examples
+grid_phxgb_tune %>%
+  slice_head(n = 10) %>%
+  knitr::kable(digits = 4)
+```
+
+# Step 7: Combine the recipe and model in a workflow
+
+```{r create-workflow}
+wflw_phxgb_tune <- workflow() %>%
+  add_model(model_phxgb_tune) %>%
+  add_recipe(rec_obj_phxgb)
+```
+
+A `workflow` keeps preprocessing and modeling together. `workflow()` creates an empty container, `add_model()` attaches Prophet-XGBoost, and `add_recipe()` attaches the preprocessing instructions. During cross-validation, the workflow prepares the recipe on each fold's training window, applies it to that fold's validation window, fits the model, and generates predictions.
+
+# Step 8: Tune the model using the cross-validation folds
+
+This is a computationally intensive, pre-rendered section: 100 parameter combinations are evaluated across five folds, for approximately 500 workflow fits.
+
+```{r tune-model, cache=TRUE}
+set.seed(2025)
+
+tune_results_phxgb <- wflw_phxgb_tune %>%
+  tune_grid(
+    resamples = resamples_kfold_resp,
+    grid = grid_phxgb_tune,
+    control = control_grid(
+      verbose = TRUE,
+      allow_par = TRUE,
+      save_pred = TRUE,
+      save_workflow = TRUE,
+      parallel_over = "resamples",
+      pkgs = c(
+        "tidymodels",
+        "modeltime",
+        "timetk"
+      )
+    ),
+    metrics = yardstick::metric_set(
+      yardstick::rmse
+    )
+  )
+
+```
+
+- `set.seed()` makes random operations as reproducible as possible.
+- `tune_grid()` applies the workflow to every grid row and cross-validation fold.
+- `resamples` supplies the five chronological folds; `grid` supplies the 100 candidate combinations.
+- `verbose = TRUE` prints progress information.
+- `allow_par = TRUE` permits parallel computation if a backend has been registered.
+- `save_pred = TRUE` retains fold-level validation predictions; `save_workflow = TRUE` stores the workflow definition.
+- `parallel_over = "resamples"` organizes possible parallel work around folds.
+- `pkgs` tells parallel workers which packages must be loaded.
+- `metric_set()` specifies how candidate models will be evaluated during cross-validation. Here, each parameter combination is evaluated using RMSE, and the combination with the lowest average cross-validation RMSE is selected.
+
+Neither the final pre-event test outcomes nor the smoke-event outcomes are used to select parameters.
+
+# Step 9: Select the best parameters and fit the final model
+
+```{r finalize-and-fit-model, cache=TRUE}
+best_params <- tune_results_phxgb %>%
+  select_best(metric = "rmse")
+
+wflw_phxgb_final <- finalize_workflow(
+  wflw_phxgb_tune,
+  best_params
+)
+
+set.seed(2025)
+
+model_fit_phxgb_final <- fit(
+  wflw_phxgb_final,
+  data = data.train
+)
+
+knitr::kable(best_params, digits = 4)
+```
+
+`select_best()` returns the combination with the lowest mean cross-validated RMSE. `finalize_workflow()` replaces every `tune()` placeholder with its selected value. `fit()` prepares the finalized recipe using all observations in `data.train` and then estimates the finalized model. The held-out `data.test` outcomes remain unused until evaluation.
+
+# Step 10: Make predictions and evaluate training and test performance
+
+```{r predict-training-and-test}
+preds_train_phxgb <- predict(
+  model_fit_phxgb_final,
+  new_data = data.train
+) %>%
+  bind_cols(data.train)
+
+preds_test_phxgb <- predict(
+  model_fit_phxgb_final,
+  new_data = data.test
+) %>%
+  bind_cols(data.test)
+```
+
+`predict()` returns a one-column tibble named `.pred`. `new_data` contains the predictors expected by the recipe; its outcome column is not used to generate predictions. `bind_cols()` attaches the dates, observed outcome, and predictors so predictions can be evaluated and plotted.
+
+```{r calculate-performance-metrics}
+metrics_train <- preds_train_phxgb %>%
+  summarise(
+    mae = Metrics::mae(respiratory, .pred),
+    rmse = Metrics::rmse(respiratory, .pred)
+  ) %>%
+  mutate(dataset = "Train")
+
+metrics_test <- preds_test_phxgb %>%
+  summarise(
+    mae = Metrics::mae(respiratory, .pred),
+    rmse = Metrics::rmse(respiratory, .pred)
+  ) %>%
+  mutate(dataset = "Test")
+
+metrics_summary <- bind_rows(
+  metrics_train,
+  metrics_test
+) %>%
+  select(dataset, everything())
+
+knitr::kable(metrics_summary, digits = 2)
+```
+
+- **MAE:** mean absolute error. It calculates the absolute difference between the observed and predicted number of hospitalizations on each day and then averages these differences across all days. It is expressed in the original outcome unit (hospitalizations per day).
+- **RMSE:** root mean squared error. It squares each daily prediction error before averaging and then takes the square root. Squaring means that days with large prediction errors receive considerably more weight than days with small errors. RMSE is also expressed in hospitalizations per day.
+
+Test errors were slightly lower than training errors, providing no evidence of substantial overfitting and suggesting that the model generalized reasonably well to this later period.
+
+
+```{r training-test-prediction-figure, fig.width=10, fig.height=6}
+evaluation_predictions <- bind_rows(
+  preds_train_phxgb %>%
+    transmute(
+      date,
+      respiratory,
+      prediction = .pred
+    ),
+  preds_test_phxgb %>%
+    transmute(
+      date,
+      respiratory,
+      prediction = .pred
+    )
+)
+
+evaluation_predictions %>%
+  ggplot(aes(x = date)) +
+  geom_line(
+    aes(y = respiratory, color = "Observed"),
+    linewidth = 0.4,
+    alpha = 0.8
+  ) +
+  geom_line(
+    aes(y = prediction, color = "Predicted"),
+    linewidth = 0.65
+  ) +
+  scale_color_manual(
+    values = c(
+      "Observed" = "#009E73",
+      "Predicted" = "#D55E00"
+    )
+  ) +
+  labs(
+    title = "Observed and Prophet-XGBoost-predicted hospitalizations before the smoke event",
+    x = NULL,
+    y = "Daily respiratory hospitalizations",
+    color = NULL
+  ) +
+  theme(legend.position = "bottom")
+```
+
+Visual evaluation complements metrics. Look for systematic underprediction or overprediction, failure to reproduce seasonal patterns, and periods with unusually large errors.
+
+# Step 11: Predict the counterfactual trajectory
+
+```{r predict-all-dates}
+data.all <- data # just to distinguish the complete dataset from data.train, data.test, etc.
+
+preds_all_phxgb <- predict(
+  model_fit_phxgb_final,
+  new_data = data.all
+) %>%
+  bind_cols(data.all)
+```
+
+`predict()` applies the finalized recipe and model without re-estimating either one.
+
+The event indicator and smoke PM2.5 are absent from the model inputs. Therefore, `.pred` during November 9–20 represents the hospitalization trajectory expected from pre-event relationships and non-smoke environmental conditions, not from knowledge of the smoke event or its observed health outcomes.
+
+
+```{r calculate-point-excess}
+## Calculate excess hospitalizations:
+## The code calculates each daily observed-minus-counterfactual difference during the event and sums those 12 differences.
+preds_event_phxgb <- preds_all_phxgb %>%
+  filter(
+    date >= as.Date("2018-11-09") &
+      date <= as.Date("2018-11-20")
+  ) %>%
+  mutate(
+    daily_excess = respiratory - .pred
+  ) %>%
+  select(date, respiratory, .pred, daily_excess)
+
+preds_event_phxgb
+
+point_impact_summary <- preds_event_phxgb %>%
+  summarise(
+    observed_hospitalizations = sum(respiratory),
+    expected_counterfactual = sum(.pred),
+    excess_hospitalizations = sum(daily_excess)
+  )
+
+knitr::kable(point_impact_summary, digits = 0)
+```
+
+
+```{r point-counterfactual-figure, fig.width=10, fig.height=5}
+preds_all_phxgb %>%
+  filter(
+    date >= as.Date("2018-10-01") &
+      date <= as.Date("2018-12-01")
+  ) %>%
+  ggplot(aes(x = date)) +
+  annotate(
+    "rect",
+    xmin = as.Date("2018-11-09"),
+    xmax = as.Date("2018-11-20"),
+    ymin = -Inf,
+    ymax = Inf,
+    fill = "#E69F00",
+    alpha = 0.18
+  ) +
+  geom_line(
+    aes(y = respiratory, color = "Observed"),
+    linewidth = 0.65
+  ) +
+  geom_line(
+    aes(y = .pred, color = "Counterfactual"),
+    linewidth = 0.8,
+    linetype = "dashed"
+  ) +
+  scale_color_manual(
+    values = c(
+      "Observed" = "#009E73",
+      "Counterfactual" = "#666666"
+    )
+  ) +
+  labs(
+    title = "Observed and counterfactual respiratory hospitalizations",
+    subtitle = "The orange band marks the November 9–20 smoke event",
+    x = NULL,
+    y = "Daily respiratory hospitalizations",
+    color = NULL
+  ) +
+  theme(legend.position = "bottom")
+```
+
+Question: 
+How do we explore the potential lagged effects of the smoke event?
+
+# Step 12: Estimate uncertainty
+
+In this example, we used 1,000 moving block bootstrap (MBB) replicates with a 14-day block length. Ordinary row-by-row residual resampling would break serial dependence. MBB resamples adjacent 14-day sequences, retaining short-term correlation within each block.
+
+See this [helpful introduction to the moving block bootstrap](https://blogs.sas.com/content/iml/2021/01/13/moving-block-bootstrap-sas.html).
+
+The selected hyperparameters remain fixed. Each replicate constructs a new training outcome from resampled residual blocks, refits the finalized workflow, and predicts one complete counterfactual trajectory.
+
+```{r moving-block-bootstrap-functions}
+resample_moving_blocks <- function(
+    residuals,
+    block_length
+) {
+  number_of_residuals <- length(residuals)
+
+  possible_starts <- seq_len(
+    number_of_residuals - block_length + 1
+  )
+
+  number_of_blocks <- ceiling(
+    number_of_residuals / block_length
+  )
+
+  sampled_starts <- sample(
+    possible_starts,
+    size = number_of_blocks,
+    replace = TRUE
+  )
+
+  sampled_residuals <- sampled_starts %>%
+    map(
+      ~ residuals[
+        .x:(.x + block_length - 1)
+      ]
+    ) %>%
+    unlist(use.names = FALSE)
+
+  sampled_residuals[
+    seq_len(number_of_residuals)
+  ]
+}
+
+fit_one_bootstrap_trajectory <- function(
+    replicate_number,
+    finalized_workflow,
+    training_data,
+    prediction_data,
+    fitted_training_values,
+    residuals,
+    block_length,
+    seed
+) {
+  set.seed(seed + replicate_number)
+
+  bootstrap_residuals <- resample_moving_blocks(
+    residuals = residuals,
+    block_length = block_length
+  )
+
+  bootstrap_training_data <- training_data %>%
+    mutate(
+      respiratory = pmax(
+        fitted_training_values + bootstrap_residuals,
+        0 # prevents negative bootstrapped hospitalization counts
+      )
+    )
+
+  bootstrap_fit <- finalized_workflow %>%
+    fit(data = bootstrap_training_data)
+
+  bootstrap_fit %>%
+    predict(new_data = prediction_data) %>%
+    pull(.pred)
+}
+```
+
+Within each bootstrap replicate, the finalized workflow is refitted to the resampled training data and used to produce one coherent prediction trajectory.
+
+```{r run-moving-block-bootstrap, cache=TRUE}
+training_fitted_values <- preds_train_phxgb %>%
+  pull(.pred)
+
+training_residuals <- preds_train_phxgb %>%
+  transmute(
+    residual = respiratory - .pred
+  ) %>%
+  pull(residual)
+
+training_residuals <- training_residuals -
+  mean(training_residuals)
+
+bootstrap_trajectories <- seq_len(
+  params$bootstrap_reps # 1000
+) %>%
+  map(
+    ~ fit_one_bootstrap_trajectory(
+      replicate_number = .x,
+      finalized_workflow = wflw_phxgb_final,
+      training_data = data.train,
+      prediction_data = data.all,
+      fitted_training_values = training_fitted_values,
+      residuals = training_residuals,
+      block_length = params$block_length,
+      seed = params$seed
+    )
+  )
+
+mbb_prediction_matrix <- do.call(
+  cbind,
+  bootstrap_trajectories
+)
+```
+
+`seq_len(params$bootstrap_reps)` creates replicate numbers 1 through 1,000. `map()` calls the bootstrap function once per number and returns a list of complete prediction vectors. `do.call(cbind, ...)` binds those vectors as columns: rows are dates and columns are bootstrap trajectories.
+
+```{r summarize-bootstrap-trajectories}
+counterfactual_bootstrap_summary <- tibble(
+  date = data.all$date,
+  counterfactual_point = preds_all_phxgb$.pred,
+  counterfactual_lower = apply(
+    mbb_prediction_matrix,
+    1,
+    quantile,
+    probs = 0.025,
+    na.rm = TRUE
+  ),
+  counterfactual_upper = apply(
+    mbb_prediction_matrix,
+    1,
+    quantile,
+    probs = 0.975,
+    na.rm = TRUE
+  )
+)
+```
+
+`counterfactual_point` is the prediction from the single finalized Prophet-XGBoost model fitted to the observed training data. It is the counterfactual trajectory used for the main excess-hospitalization estimate. The two `apply(..., 1, quantile, ...)` calls calculate the 2.5th and 97.5th percentiles of the bootstrap predictions separately for each date; these form the pointwise uncertainty ribbon around the original-model trajectory.
+
+Centering the training residuals at zero before resampling prevents a nonzero average residual from systematically shifting all bootstrap outcomes. This affects only the uncertainty resamples: it does not replace or alter `counterfactual_point`, and it does not force the interval to be symmetric.
+
+```{r cumulative-bootstrap-uncertainty}
+event_rows <- which(
+  data.all$date >= as.Date("2018-11-09") &
+    data.all$date <= as.Date("2018-11-20")
+)
+
+observed_event_counts <- data.all %>%
+  slice(event_rows) %>%
+  pull(respiratory)
+
+bootstrap_total_counterfactual <- apply(
+  mbb_prediction_matrix[
+    event_rows, # selected rows
+    ,           # all columns
+    drop = FALSE
+  ],
+  2,
+  sum
+)
+
+bootstrap_total_excess <-
+  sum(observed_event_counts) -
+  bootstrap_total_counterfactual
+
+excess_interval <- quantile(
+  bootstrap_total_excess,
+  probs = c(0.025, 0.975),
+  na.rm = TRUE
+)
+
+impact_summary <- point_impact_summary %>%
+  mutate(
+    lower_95_eCI = unname(excess_interval[1]),
+    upper_95_eCI = unname(excess_interval[2])
+  )
+
+knitr::kable(impact_summary, digits = 0)
+```
+
+`apply(..., 2, sum)` works down one complete matrix column at a time and sums its 12 event-period counterfactual predictions. Subtracting each replicate-level counterfactual total from the observed total produces 1,000 cumulative excess estimates. Their 2.5th and 97.5th percentiles provide the empirical confidence limits. The reported central estimate remains the excess calculated from the original fitted model in `point_impact_summary`; it does not have to be the arithmetic midpoint of the bootstrap interval.
+
+
+```{r counterfactual-uncertainty-figure, fig.width=10, fig.height=5.5}
+counterfactual_plot_data <- counterfactual_bootstrap_summary %>%
+  left_join(
+    data.all %>% select(date, respiratory),
+    by = "date"
+  ) %>%
+  filter(
+    date >= as.Date("2018-10-01") &
+      date <= as.Date("2018-12-01")
+  )
+
+counterfactual_plot_data %>%
+  ggplot(aes(x = date)) +
+  annotate(
+    "rect",
+    xmin = as.Date("2018-11-09"),
+    xmax = as.Date("2018-11-20"),
+    ymin = -Inf,
+    ymax = Inf,
+    fill = "#E69F00",
+    alpha = 0.16
+  ) +
+  geom_ribbon(
+    aes(
+      ymin = counterfactual_lower,
+      ymax = counterfactual_upper
+    ),
+    fill = "#56B4E9",
+    alpha = 0.25
+  ) +
+  geom_line(
+    aes(y = respiratory, color = "Observed"),
+    linewidth = 0.65
+  ) +
+  geom_line(
+    aes(
+      y = counterfactual_point,
+      color = "Counterfactual"
+    ),
+    linewidth = 0.8,
+    linetype = "dashed"
+  ) +
+  scale_color_manual(
+    values = c(
+      "Observed" = "#009E73",
+      "Counterfactual" = "#666666"
+    )
+  ) +
+  labs(
+    title = "Counterfactual trajectory with 95% eCI",
+    x = NULL,
+    y = "Daily respiratory hospitalizations",
+    color = NULL
+  ) +
+  theme(legend.position = "bottom")
+```
+
+### Other approaches to time-series uncertainty
+
+The moving block bootstrap is only one method for accounting for temporal dependence. Other options include (but not limited to):
+
+- **Non-overlapping block bootstrap:** Divides the series into separate, fixed-length blocks and resamples those blocks. It is simple but provides fewer possible blocks than the moving block bootstrap.
+
+- **Circular block bootstrap:** Treats the end of the series as connected to the beginning, allowing a sampled block to wrap around the boundary. This can reduce the special treatment of observations near the beginning and end of the series.
+
+- **Stationary bootstrap:** Resamples blocks with random rather than fixed lengths. Short and long blocks can therefore appear in the same bootstrap replicate, while temporal dependence is retained on average.
+
+MBB is a relatively model-agnostic way to preserve short-term dependence in the residuals. Other methods make different decisions about how blocks are constructed or impose a time-series model and simulate from it. There is no universally best method; the choice depends on the data and assumptions.
+
+Read more if you are interested:
+
+- [Forecasting: Principles and Practice — Bootstrapping and bagging](https://otexts.com/fpp3/bootstrap.html).
+
+- [R documentation for `boot::tsboot()`](https://stat.ethz.ch/R-manual/R-devel/library/boot/help/tsboot.html).
+
+# Interpretation and revisit the assumptions
+
+The excess estimate is the difference between observed hospitalizations and the model-based counterfactual during November 9–20. Important assumptions include:
+
+1. the pre-event model adequately represents how outcomes would have evolved without the smoke event;
+2. no concurrent event independently caused a major change in hospitalizations;
+3. counterfactual predictors are not themselves consequences of the smoke event;
+4. the intervention and outcome are measured consistently; and
+5. the training period, features, and model are sufficiently stable for predicting outcomes during the event period.
+
+Strong predictive performance on `data.test` supports, but does not prove, the validity of the counterfactual model. Researchers must also use subject-matter knowledge and understanding of the real-world setting to judge whether the model assumptions are reasonable.
+
+# For Python user: the `its2s` package
+
+Our R walkthrough builds each component manually so you can see the logic clearly. 
+
+The Python [`its2s`](https://itslab.io/) packages the same general two-stage counterfactual workflow into higher-level functions.
+
+Conceptually, the `run_single_its()` in this package performs the following steps:
+
+1. Splits the time series into training, pre-event testing, and post-event holdout periods.
+2. Fits the selected counterfactual model using only the training data.
+3. Predicts the outcomes during the test and holdout periods.
+4. Evaluates prediction performance during the pre-event test period.
+5. Applies the moving block bootstrap to estimate uncertainty in the counterfactual trajectory.
+6. Calculates the daily and cumulative differences between the observed and counterfactual outcomes.
+7. Returns the results as Python objects and, optionally, saves tables and figures.
+
