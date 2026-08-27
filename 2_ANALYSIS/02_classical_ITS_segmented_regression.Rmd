@@ -1,0 +1,826 @@
+---
+title: "Classical Interrupted Time Series Analysis with Segmented Regression"
+subtitle: "Part 2 of ISEE pre-conference workshop Interrupted Time Series Analysis in Environmental Epidemiology: An Overview of Traditional and Novel Modeling Approaches"
+date: "2026-08-30"
+author: "Tarik Benmarhnia, Yiqun Ma"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+params:
+  data_path: "../../1_DATA/data_case_study_11to18.RDS"
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(splines)
+library(tsModel)
+library(patchwork)
+library(scales)
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.align = "center",
+  out.width = "100%"
+)
+
+theme_set(
+  theme_minimal(base_size = 12) +
+    theme(
+      panel.grid.minor = element_blank(),
+      plot.title.position = "plot",
+      plot.caption.position = "plot"
+    )
+)
+```
+
+# Learning objectives
+
+By the end of this section, you should be able to:
+
+1. Translate the scientific question into a segmented-regression model.
+2. Explain how long-term trend, seasonality, day of week, and environmental predictors contribute to the model.
+3. Interpret the event coefficient from a segmented regression.
+4. Evaluate and compare different model specifications.
+5. Generate a counterfactual hospitalization trajectory by setting the event indicator to zero.
+6. Estimate attributable respiratory hospitalizations from the event rate ratio.
+7. Interpret a time-varying event effect and explore possible post-event lag effects.
+
+# Load required packages
+
+```{r load-packages}
+library(tidyverse)
+library(splines)
+library(tsModel)
+library(patchwork)
+library(scales)
+```
+
+# Read and prepare the case-study data
+
+```{r read-data}
+## load the case study dataset "data_case_study_11to18.RDS" using its file path in your device
+data <- readRDS(params$data_path) %>%
+  mutate(
+    date = as.Date(date),
+    dow = as.factor(dow)
+  ) %>%
+  arrange(date)
+
+event_dates <- data %>%
+  filter(event == 1) %>%
+  pull(date)
+
+event_start <- min(event_dates)
+event_end <- max(event_dates)
+
+event_band <- tibble(
+  xmin = event_start,
+  xmax = event_end + 1
+)
+```
+
+# From the scientific question to the statistical model
+
+The outcome is the daily count of respiratory hospitalizations. We use a quasi-Poisson regression with a log link:
+
+$$
+\log\{E(Y_t)\} = \beta_0 + \beta_1 Event_t + \beta_2 Time_t
++ Seasonality_t + DayOfWeek_t + EnvironmentalPredictors_t.
+$$
+
+The main coefficient of interest is $\beta_1$:
+
+$$
+RR_{event} = \exp(\beta_1).
+$$
+
+$\exp(\beta_1)$ is the rate ratio comparing hospitalization rates during the smoke event with the rates that would have been expected during the same days without the smoke event, after accounting for long-term trends, seasonality, day of week, weather, and other included factors.
+
+In this model, `event` returns from 1 to 0 immediately after November 20. The outcome is assumed to return to its modeled counterfactual trajectory immediately after the event.  
+
+This specification assumes no lagged smoke effect. This assumption is convenient for an introductory model; possible lagged effects will be explored later.
+
+Because this is one county and daily population changes little over the study period, we model daily counts directly. If the population at risk or person-time varied meaningfully, an offset such as `offset(log(population))` would be needed to model rates explicitly.
+
+# Step 1: A crude event-period comparison
+
+Begin with an event indicator alone:
+
+```{r crude-model}
+model_crude <- glm(
+  respiratory ~ event,
+  family = quasipoisson(link = "log"),
+  data = data
+)
+
+summary(model_crude)
+```
+
+This compares event days with all non-event days. It is **not yet a credible ITS model** because it does not account for the long-term trend, annual seasonality, or weekly patterns.
+
+The model summaries report `AIC: NA` because quasi-Poisson specifies a mean-variance relationship but not a complete probability likelihood. Ordinary AIC requires a maximized likelihood and is therefore undefined. We will calculate quasi-Akaike Information Criterion (QAIC) later.
+
+# Step 2: Adjust for the long-term time trend
+
+```{r trend-model}
+model_trend <- glm(
+  respiratory ~ event + time,
+  family = quasipoisson(link = "log"),
+  data = data
+)
+
+summary(model_trend)
+```
+
+In this model:
+
+- `event` represents the event-period rate ratio;
+- `time` represents the average multiplicative change per day across the study period; and
+- the intercept is the expected log count at the model's reference values and is usually not substantively meaningful.
+
+
+# Step 3: Adjust for seasonality and day of week
+
+Daily hospitalizations may follow annual and weekly patterns. We add two pairs of harmonic terms for annual seasonality and a categorical day-of-week variable.
+
+```{r seasonal-model}
+model_seasonal <- glm(
+  respiratory ~ event + time +
+    harmonic(doy, 2, 365) + dow,
+  family = quasipoisson(link = "log"),
+  data = data
+)
+
+summary(model_seasonal)
+```
+
+The call `harmonic(doy, 2, 365)` creates four Fourier terms:
+
+$$
+\sin\left(\frac{2\pi doy}{365}\right),\quad
+\cos\left(\frac{2\pi doy}{365}\right),\quad
+\sin\left(\frac{4\pi doy}{365}\right),\quad
+\cos\left(\frac{4\pi doy}{365}\right).
+$$
+
+The first sine-cosine pair represents a smooth annual cycle. The second pair represents a twice-yearly, or approximately half-year, cycle and allows a more flexible seasonal shape. A sine and cosine are included together so that the timing, amplitude, and phase of the seasonal pattern are estimated from the data rather than fixed in advance. The four coefficients should be interpreted jointly, not one at a time.
+
+Similarly, each `dow` coefficient compares that day with the reference day of week.
+
+Other reasonable approaches to seasonality include calendar-month indicators, more or fewer Fourier pairs, or a cyclic spline of day of year such as `mgcv::s(doy, bs = "cc")`.
+
+Alternatives for long-term trend include polynomial terms, natural splines of calendar time, year indicators, piecewise trends, or a smooth term in a generalized additive model (see examples here: [Bhaskaran et al., (2013)](https://academic.oup.com/ije/article/42/4/1187/657875).). Greater flexibility can reduce residual pattern but can also absorb part of a short event signal. You may explore these options later as you see fit.
+
+# Step 4: Add environmental predictors
+
+The fully adjusted model further includes non-smoke PM2.5, temperature, relative humidity, and precipitation. We use non-smoke rather than total or smoke PM2.5 because total and smoke PM2.5 define the event exposure itself.
+
+```{r full-model}
+model_full <- glm(
+  respiratory ~ event + time +
+    harmonic(doy, 2, 365) + dow +
+    PM25_nonsmk + ns(Tmean, df = 3) + RH + Prcp,
+  family = quasipoisson(link = "log"),
+  data = data
+)
+
+summary(model_full)
+```
+
+The natural spline allows a nonlinear association between temperature and respiratory hospitalizations.
+
+# Interpret the event coefficient
+
+Create a small function that converts its log-rate coefficient and standard error to a rate ratio and 95% confidence interval.
+
+```{r event-estimate-function}
+extract_event_estimate <- function(fitted_model, model_name) {
+  beta <- coef(fitted_model)["event"]
+  standard_error <- sqrt(
+    vcov(fitted_model)["event", "event"]
+  )
+
+  tibble(
+    model = model_name,
+    log_rate_ratio = beta,
+    rate_ratio = exp(beta),
+    lower_95_CI = exp(beta - 1.96 * standard_error),
+    upper_95_CI = exp(beta + 1.96 * standard_error),
+    percent_change = 100 * (exp(beta) - 1)
+  )
+}
+
+full_event_estimate <- extract_event_estimate(
+  model_full,
+  "Fully adjusted segmented regression"
+)
+
+knitr::kable(full_event_estimate, digits = 3)
+```
+
+Interpretation: After accounting for long-term trend, seasonality, day of week, non-smoke PM2.5, temperature, relative humidity, and precipitation, respiratory hospitalizations were estimated to be `r round(full_event_estimate$percent_change, 1)`% higher during the smoke-event period (RR: `r round(full_event_estimate$rate_ratio, 2)`; 95% CI: `r round(full_event_estimate$lower_95_CI, 2)`, `r round(full_event_estimate$upper_95_CI, 2)`).
+
+# Compare model specifications
+
+```{r compare-event-estimates}
+event_estimates <- bind_rows(
+  extract_event_estimate(model_crude, "Event indicator only"),
+  extract_event_estimate(model_trend, "+ linear time trend"),
+  extract_event_estimate(model_seasonal, "+ seasonality and day of week"),
+  extract_event_estimate(model_full, "+ environmental predictors")
+)
+
+event_estimates %>%
+  select(model, rate_ratio, lower_95_CI, upper_95_CI, percent_change) %>%
+  knitr::kable(digits = 3)
+```
+
+# Model evaluation
+
+Model evaluation addresses several different questions:
+
+- **Overall fit:** How closely do fitted values follow observed counts?
+- **Overdispersion:** Is the outcome variance larger than expected under a Poisson model?
+- **Relative fit and complexity:** Does additional model complexity improve QAIC?
+- **Effect robustness:** Is the event estimate stable across reasonable specifications?
+
+Although quasi-Poisson regression accounts for overdispersion when estimating standard errors, we still examine the dispersion parameter as a diagnostic. It tells us how much unexplained variability remains and whether adjustment for temporal patterns and covariates improves the model.
+
+We use QAIC to measure relative information loss specifically when data suffers from overdispersion (when the data variance is much larger than what the statistical model expects). A lower QAIC indicates better relative support after penalizing model complexity.
+
+## Create a common evaluation table
+
+```{r evaluation-function}
+calculate_qaic <- function(fitted_model, common_dispersion) {
+
+  # Extract the observed outcome values used to fit the model
+  observed_values <- model.response(
+    model.frame(fitted_model)
+  )
+
+  # Calculate the Poisson log-likelihood using the model's fitted means
+  poisson_log_likelihood <- sum(
+    dpois(
+      observed_values,
+      lambda = fitted(fitted_model),
+      log = TRUE
+    )
+  )
+
+  # Count regression coefficients plus the dispersion parameter
+  number_parameters <- length(
+    coef(fitted_model)
+  ) + 1
+
+  # Calculate QAIC
+  -2 * poisson_log_likelihood /
+    common_dispersion +
+    2 * number_parameters
+}
+
+# For valid QAIC comparisons, all models must use the same outcome observations and the same overdispersion estimate.
+candidate_sample_sizes <- c(
+  nobs(model_crude),
+  nobs(model_trend),
+  nobs(model_seasonal),
+  nobs(model_full)
+)
+
+if (length(unique(candidate_sample_sizes)) != 1) {
+  stop(
+    paste(
+      "QAIC comparisons require all candidate models",
+      "to use the same observations."
+    ),
+    call. = FALSE
+  )
+}
+
+
+# Here, the common dispersion is estimated from the fully adjusted model, `model_full`.
+common_dispersion <- sum(
+  residuals(
+    model_full,
+    type = "pearson"
+  )^2,
+  na.rm = TRUE
+) / model_full$df.residual
+
+evaluate_model <- function(
+    fitted_model,
+    model_name,
+    common_dispersion) {
+
+  if (!inherits(fitted_model, "glm")) {
+    stop("`fitted_model` must be a fitted glm object.", call. = FALSE)
+  }
+
+  observed_values <- model.response(
+    model.frame(fitted_model)
+  )
+
+  pearson_residuals <- residuals(fitted_model, type = "pearson")
+  fitted_values <- fitted(fitted_model)
+
+  dispersion_value <- sum(
+    pearson_residuals^2,
+    na.rm = TRUE
+  ) / fitted_model$df.residual
+
+  tibble(
+    model = model_name,
+    observations = nobs(fitted_model),
+    MAE = mean(
+      abs(observed_values - fitted_values),
+      na.rm = TRUE
+    ),
+    RMSE = sqrt(
+      mean(
+        (observed_values - fitted_values)^2,
+        na.rm = TRUE
+      )
+    ),
+    dispersion = dispersion_value,
+    QAIC = calculate_qaic(
+      fitted_model,
+      common_dispersion
+    )
+  )
+}
+
+model_evaluation <- bind_rows(
+  evaluate_model(
+    model_crude,
+    "Event indicator only",
+    common_dispersion
+  ),
+  evaluate_model(
+    model_trend,
+    "+ linear time trend",
+    common_dispersion
+  ),
+  evaluate_model(
+    model_seasonal,
+    "+ seasonality and day of week",
+    common_dispersion
+  ),
+  evaluate_model(
+    model_full,
+    "+ environmental predictors",
+    common_dispersion
+  )
+) %>%
+  mutate(
+    delta_QAIC = QAIC - min(QAIC)
+  ) %>%
+  arrange(QAIC)
+
+knitr::kable(model_evaluation, digits = 3)
+```
+
+Interpret these measures together:
+
+- Smaller MAE (Mean Absolute Error) and RMSE (Root Mean Squared Error) indicate closer in-sample fit.
+- A dispersion value substantially larger than 1 supports using quasi-Poisson rather than ordinary Poisson standard errors.
+- Smaller QAIC indicates better relative support among the candidate models; `delta_QAIC` expresses the difference from the lowest-QAIC model.
+- These checks strengthen the analysis, but they cannot test causal assumptions such as the absence of a concurrent event.
+
+# Construct the counterfactual trajectory
+
+For the counterfactual scenario, retain the same dates, seasonal terms, day of week, and environmental predictors, but set `event` to zero for every day.
+
+```{r counterfactual-prediction}
+data_counterfactual <- data %>%
+  mutate(event = 0)
+
+counterfactual_prediction <- predict(
+  model_full,
+  newdata = data_counterfactual,
+  type = "link",
+  se.fit = TRUE
+)
+
+data_results <- data %>%
+  mutate(
+    fitted = predict(model_full, type = "response"),
+    counterfactual = exp(counterfactual_prediction$fit),
+    counterfactual_lower = exp(
+      counterfactual_prediction$fit - 1.96 * counterfactual_prediction$se.fit
+    ),
+    counterfactual_upper = exp(
+      counterfactual_prediction$fit + 1.96 * counterfactual_prediction$se.fit
+    )
+  )
+```
+
+
+# Visualize observed, fitted, and counterfactual hospitalizations
+
+```{r counterfactual-figure, fig.width=11, fig.height=6}
+display_start <- event_start - 60
+display_end <- event_end + 30
+
+data_results_event <- data_results %>%
+  filter(date >= display_start, date <= display_end)
+
+ggplot(data_results_event, aes(x = date)) +
+  geom_rect(
+    data = event_band,
+    aes(xmin = xmin, xmax = xmax, ymin = -Inf, ymax = Inf),
+    inherit.aes = FALSE,
+    fill = "#E69F00",
+    alpha = 0.16
+  ) +
+  geom_ribbon(
+    aes(
+      ymin = counterfactual_lower,
+      ymax = counterfactual_upper
+    ),
+    fill = "#BDBDBD",
+    alpha = 0.35
+  ) +
+  geom_line(
+    aes(y = respiratory, color = "Observed"),
+    linewidth = 0.45
+  ) +
+  geom_point(
+    aes(y = respiratory, color = "Observed"),
+    size = 1.2,
+    alpha = 0.65
+  ) +
+  geom_line(
+    aes(y = fitted, color = "Fitted"),
+    linewidth = 0.85
+  ) +
+  geom_line(
+    aes(y = counterfactual, color = "Counterfactual"),
+    linewidth = 0.85,
+    linetype = "dashed"
+  ) +
+  scale_color_manual(
+    values = c(
+      "Observed" = "#0072B2",
+      "Fitted" = "#E69F00",
+      "Counterfactual" = "#5B5B5B"
+    )
+  ) +
+  scale_x_date(date_breaks = "2 weeks", date_labels = "%b %d") +
+  labs(
+    title = "Observed, fitted, and counterfactual respiratory hospitalizations",
+    x = NULL,
+    y = "Daily respiratory hospitalizations",
+    color = NULL
+  ) +
+  theme(
+    legend.position = "bottom",
+    axis.text.x = element_text(angle = 90, hjust = 1)
+  )
+```
+
+The interval above is a pointwise confidence interval for the expected mean under the modeled counterfactual. It describes uncertainty in each day's expected counterfactual mean. It is not a prediction interval for individual daily counts.
+
+# Estimate attributable hospitalizations from the event rate ratio
+
+We can estimate the attributable fraction and attributable number from the event rate ratio:
+
+$$
+AF = \frac{RR-1}{RR} = 1 - \frac{1}{RR}
+   = 1 - \exp(-\beta_{event}),
+$$
+
+$$
+AN = Y_{event}\times AF,
+$$
+
+where $Y_{event}$ is the observed total during the 12 event days. Transforming the lower and upper limits of the event coefficient gives the confidence interval for the attributable fraction and, after multiplication by the fixed observed event total, the attributable number.
+
+```{r attributable-number}
+event_results <- data_results %>%
+  filter(event == 1)
+
+observed_event_total <- event_results %>%
+  summarise(
+    total = sum(respiratory)
+  ) %>%
+  pull(total)
+
+expected_counterfactual_total <- event_results %>%
+  summarise(
+    total = sum(counterfactual)
+  ) %>%
+  pull(total)
+
+event_beta <- coef(model_full)["event"]
+event_standard_error <- sqrt(
+  vcov(model_full)["event", "event"]
+)
+
+event_beta_lower <- event_beta -
+  1.96 * event_standard_error
+
+event_beta_upper <- event_beta +
+  1.96 * event_standard_error
+
+attributable_results <- tibble(
+  observed_hospitalizations = observed_event_total,
+  expected_counterfactual = expected_counterfactual_total,
+  rate_ratio = exp(event_beta),
+  attributable_fraction_percent =
+    100 * (1 - exp(-event_beta)),
+  attributable_hospitalizations =
+    observed_event_total * (1 - exp(-event_beta)),
+  lower_95_CI =
+    observed_event_total * (1 - exp(-event_beta_lower)),
+  upper_95_CI =
+    observed_event_total * (1 - exp(-event_beta_upper))
+)
+
+knitr::kable(attributable_results, digits = 2)
+```
+
+For this log-link model with one constant event rate ratio, the AF-based attributable-number point estimate is essentially the same as `observed_hospitalizations - expected_counterfactual`. 
+
+# Participant exercise 1: allow the event association to change during the event
+
+The primary fully adjusted model assumes one constant event rate ratio across all 12 smoke-event days. As an extension, allow that rate ratio to change linearly over the event by adding a `time * event` interaction.
+
+Using raw `time` would make the `event` coefficient refer to `time = 0`, which occurred long before the smoke event. First center time at the midpoint of the event, then fit the interaction model.
+
+```{r event-time-interaction-exercise, eval=FALSE}
+event_midpoint_time <- data %>%
+  filter(event == 1) %>%
+  summarise(
+    midpoint = mean(___)
+  ) %>%
+  pull(midpoint)
+
+data_interaction <- data %>%
+  mutate(
+    time_centered_at_event = ___ - event_midpoint_time
+  )
+
+model_event_interaction <- glm(
+  respiratory ~ event * ___ +
+    harmonic(doy, 2, 365) + dow +
+    PM25_nonsmk + ns(Tmean, df = 3) + RH + Prcp,
+  family = quasipoisson(link = "log"),
+  data = data_interaction
+)
+
+summary(model_event_interaction)
+```
+
+
+## Example answer: fit and interpret the interaction model
+
+```{r event-time-interaction-answer}
+event_midpoint_time <- data %>%
+  filter(event == 1) %>%
+  summarise(
+    midpoint = mean(time)
+  ) %>%
+  pull(midpoint)
+
+data_interaction <- data %>%
+  mutate(
+    time_centered_at_event =
+      time - event_midpoint_time
+  )
+
+model_event_interaction <- glm(
+  respiratory ~ event * time_centered_at_event +
+    harmonic(doy, 2, 365) + dow +
+    PM25_nonsmk + ns(Tmean, df = 3) + RH + Prcp,
+  family = quasipoisson(link = "log"),
+  data = data_interaction
+)
+
+summary(model_event_interaction)
+```
+
+Because `event * time_centered_at_event` expands to `event + time_centered_at_event + event:time_centered_at_event`, the model contains three relevant coefficients:
+
+- `time_centered_at_event` is the background linear time slope outside the event. Centering changes the intercept but not this slope or the fitted values.
+- `event` is the log rate ratio at the event midpoint, where `time_centered_at_event = 0`.
+- `event:time_centered_at_event` is the daily change in the log event rate ratio. Its exponential is the ratio by which the event RR is multiplied for each additional event day—not the event RR itself.
+
+During the event, the overall outcome time slope is the background slope plus the interaction coefficient. Outside the event, both event-related terms are zero.
+
+
+At each event time $d$, the event rate ratio is
+
+$$
+RR(d) = \exp\{\beta_{event} + d\,\beta_{event\times time}\}.
+$$
+
+The event and interaction coefficients are estimated jointly, so the standard error for $RR(d)$ must incorporate their covariance. The contrast-matrix code below calculates the RR and pointwise confidence interval for every event day.
+
+```{r time-varying-event-rate-ratios}
+event_rr_data <- data_interaction %>%
+  filter(event == 1) %>%
+  transmute(
+    date,
+    event_day = row_number(),
+    time_centered_at_event
+  )
+
+coefficient_names <- names(
+  coef(model_event_interaction)
+)
+
+event_rr_contrast <- matrix(
+  0,
+  nrow = nrow(event_rr_data),
+  ncol = length(coefficient_names),
+  dimnames = list(NULL, coefficient_names)
+)
+
+event_rr_contrast[, "event"] <- 1
+event_rr_contrast[, "event:time_centered_at_event"] <-
+  event_rr_data$time_centered_at_event
+
+event_log_rate_ratio <- drop(
+  event_rr_contrast %*%
+    coef(model_event_interaction)
+)
+
+event_log_rate_ratio_se <- sqrt(
+  diag(
+    event_rr_contrast %*%
+      vcov(model_event_interaction) %*%
+      t(event_rr_contrast)
+  )
+)
+
+time_varying_event_estimates <- event_rr_data %>%
+  mutate(
+    log_rate_ratio = event_log_rate_ratio,
+    rate_ratio = exp(log_rate_ratio),
+    lower_95_CI = exp(
+      log_rate_ratio -
+        1.96 * event_log_rate_ratio_se
+    ),
+    upper_95_CI = exp(
+      log_rate_ratio +
+        1.96 * event_log_rate_ratio_se
+    )
+  )
+
+time_varying_event_estimates %>%
+  select(
+    event_day,
+    date,
+    rate_ratio,
+    lower_95_CI,
+    upper_95_CI
+  ) %>%
+  knitr::kable(digits = 3)
+```
+
+A positive interaction means that the event RR increases across the episode; a negative interaction means that it diminishes. With only 12 event observations, this extension is exploratory.
+
+
+## Optional comparison with the constant-effect model
+
+For a comparison between these two models, estimate the common QAIC dispersion from the more highly parameterized interaction model.
+
+```{r event-time-interaction-comparison}
+interaction_common_dispersion <- sum(
+  residuals(
+    model_event_interaction,
+    type = "pearson"
+  )^2,
+  na.rm = TRUE
+) / model_event_interaction$df.residual
+
+interaction_model_comparison <- bind_rows(
+  evaluate_model(
+    model_full,
+    "Constant event RR",
+    interaction_common_dispersion
+  ),
+  evaluate_model(
+    model_event_interaction,
+    "Time-varying event RR",
+    interaction_common_dispersion
+  )
+) %>%
+  mutate(
+    delta_QAIC = QAIC - min(QAIC)
+  ) %>%
+  arrange(QAIC)
+
+knitr::kable(
+  interaction_model_comparison,
+  digits = 3
+)
+
+anova(
+  model_full,
+  model_event_interaction,
+  test = "F"
+)
+```
+
+
+# Participant exercise 2: explore possible lagged effects
+
+The main model assumes an immediate return to the counterfactual trajectory after November 20. As a short exercise, create indicators for days 1–7 after the event, add it to the fully adjusted model, and interpret its rate ratio.
+
+```{r lag-exercise, eval=FALSE}
+data_lag <- data %>%
+  mutate(
+    post_event_1_7 = as.integer(
+      date >= event_end + 1 &
+        date <= event_end + ___
+    )
+  )
+
+model_lag <- glm(
+  respiratory ~ event + ___ + time +
+    harmonic(doy, 2, 365) + dow +
+    PM25_nonsmk + ns(Tmean, df = 3) + RH + Prcp,
+  family = quasipoisson(link = "log"),
+  data = data_lag
+)
+
+summary(model_lag)
+```
+
+
+## Example answer
+
+```{r lag-example-answer}
+data_lag <- data %>%
+  mutate(
+    post_event_1_7 = as.integer(
+      date >= event_end + 1 &
+        date <= event_end + 7
+    )
+  )
+
+model_lag <- glm(
+  respiratory ~ event +
+    post_event_1_7 + time +
+    harmonic(doy, 2, 365) + dow +
+    PM25_nonsmk + ns(Tmean, df = 3) + RH + Prcp,
+  family = quasipoisson(link = "log"),
+  data = data_lag
+)
+
+lag_terms <- c(
+  "event",
+  "post_event_1_7"
+)
+
+lag_coefficient_table <- summary(model_lag)$coefficients
+
+lag_estimates <- tibble(
+  period = c(
+    "During smoke event",
+    "Post-event days 1-7"
+  ),
+  log_rate_ratio = lag_coefficient_table[
+    lag_terms,
+    "Estimate"
+  ],
+  standard_error = lag_coefficient_table[
+    lag_terms,
+    "Std. Error"
+  ]
+) %>%
+  mutate(
+    rate_ratio = exp(log_rate_ratio),
+    lower_95_CI = exp(
+      log_rate_ratio - 1.96 * standard_error
+    ),
+    upper_95_CI = exp(
+      log_rate_ratio + 1.96 * standard_error
+    )
+  ) %>%
+  select(
+    period,
+    rate_ratio,
+    lower_95_CI,
+    upper_95_CI
+  )
+
+knitr::kable(lag_estimates, digits = 3)
+```
+
+Here, the post-event coefficients compare their respective days with all days outside the event and lag windows, conditional on the same temporal and environmental terms. This is a simple lag-window sensitivity analysis, not a full distributed-lag model. After day 7, the model again assumes no remaining event-related elevation.
+
+
+# Things to consider after the workshop
+
+The presented model is one reasonable teaching specification, not necessarily the best model for these data. You are encouraged to explore at home:
+
+- Alternative ways to model long-term trends (e.g., linear, polynomial, spline, piecewise, or GAM-based specifications);
+- Alternative ways to model seasonality (e.g., one, two, or three Fourier pairs, calendar indicators, or different splines);
+- Alternative lag windows and specifications;
+- Different specifications for temperature and other predictors; and
+- Models or uncertainty estimators that explicitly address residual autocorrelation.
