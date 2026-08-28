@@ -9,7 +9,7 @@ output:
     toc_float: true
     code_folding: show
 params:
-  data_path: "../../1_DATA/multiple_event_data.RDS"
+  data_path: "../1_DATA/multiple_event_data.RDS"
 ---
 
 ```{r setup, include=FALSE}
